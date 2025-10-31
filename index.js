@@ -1,476 +1,268 @@
-// index.js
-// Glow Market Hunter - versión ciudad
-// ------------------------------------------------------------
-// Hace 3 cosas principales:
-// 1. /places/city-search      -> busca negocios en una ciudad completa
-// 2. /sheets/append           -> guarda filas en la pestaña de esa ciudad en Google Sheets
-// 3. /openapi.json            -> describe esta API para que el agente la entienda
-//
-// IMPORTANTE:
-// Environment variables necesarias en Render:
-//   GOOGLE_API_KEY
-//   GOOGLE_SERVICE_ACCOUNT_JSON   (JSON del service account, en una sola línea)
-//   SHEET_ID
-//   PUBLIC_URL (por ejemplo "https://glow-market-hunter.onrender.com")
-//
-// También asegurate que en el Google Sheet exista una pestaña con el NOMBRE EXACTO de la ciudad
-// (por ejemplo "Bogotá") y que la fila 1 tenga estas columnas:
-//
-// timestamp | country | city | category | business_name | phone | address | lat | lng | rating | place_id | source
-//
-// El orden TIENE que coincidir con el orden que mandamos en rows.
-//
-
+// index.js (versión ciudad + categoría)
+// -------------------------------------------------
+// IMPORTS Y SETUP BÁSICO
 import express from "express";
+import bodyParser from "body-parser";
 import cors from "cors";
+import fetch from "node-fetch";
 import { google } from "googleapis";
 
-// ------------------------------------------------------------
-// Setup básico de Express
-// ------------------------------------------------------------
+// Cargar variables de entorno desde Render
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const SHEET_ID = process.env.SHEET_ID;
+const SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+
+// App
 const app = express();
+app.use(bodyParser.json());
 app.use(cors());
-app.use(express.json()); // para leer JSON en POST
 
-const PORT = process.env.PORT || 10000;
+// -------------------------------------------------
+// GOOGLE SHEETS AUTH
+// Vamos a usar la cuenta de servicio para escribir en la hoja
+let sheetsClient = null;
+function getSheetsClient() {
+  if (sheetsClient) return sheetsClient;
 
-// ------------------------------------------------------------
-// Configuración de Google Sheets (Service Account)
-// ------------------------------------------------------------
+  if (!SERVICE_ACCOUNT_JSON) {
+    throw new Error("Falta GOOGLE_SERVICE_ACCOUNT_JSON en env");
+  }
 
-// Esta variable viene de Render > Environment > GOOGLE_SERVICE_ACCOUNT_JSON
-// Ejemplo de valor (todo en una sola línea):
-// {
-//   "type": "...",
-//   "project_id": "...",
-//   "private_key_id": "...",
-//   "private_key": "-----BEGIN PRIVATE KEY-----\n...",
-//   "client_email": "...",
-//   "client_id": "...",
-//   "auth_uri": "...",
-//   "token_uri": "...",
-//   "auth_provider_x509_cert_url": "...",
-//   "client_x509_cert_url": "..."
-// }
-let serviceAccount;
-try {
-  serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-} catch (err) {
-  console.error("ERROR: GOOGLE_SERVICE_ACCOUNT_JSON no es JSON válido o no está seteado.");
-  serviceAccount = null;
+  // SERVICE_ACCOUNT_JSON es un string con JSON adentro.
+  const serviceAccount = JSON.parse(SERVICE_ACCOUNT_JSON);
+
+  const auth = new google.auth.JWT(
+    serviceAccount.client_email,
+    null,
+    serviceAccount.private_key,
+    ["https://www.googleapis.com/auth/spreadsheets"]
+  );
+
+  sheetsClient = google.sheets({ version: "v4", auth });
+  return sheetsClient;
 }
 
-// Creamos el cliente JWT para acceder a Sheets
-const sheetsAuth = serviceAccount
-  ? new google.auth.JWT(
-      serviceAccount.client_email,
-      null,
-      serviceAccount.private_key,
-      ["https://www.googleapis.com/auth/spreadsheets"]
-    )
-  : null;
-
-// Creamos el cliente de Google Sheets
-const sheetsClient = sheetsAuth
-  ? google.sheets({ version: "v4", auth: sheetsAuth })
-  : null;
-
-// ------------------------------------------------------------
-// Helper: construir fila lista para ir al Sheet
-// ------------------------------------------------------------
-//
-// Orden de columnas que vamos a mandar a Google Sheets:
-//   A: timestamp
-//   B: country
-//   C: city
-//   D: category
-//   E: business_name
-//   F: phone
-//   G: address
-//   H: lat
-//   I: lng
-//   J: rating
-//   K: place_id
-//   L: source
-//
-// IMPORTANTE: este orden TIENE que coincidir con la fila 1 de cada pestaña ciudad.
-//
-
-function mapPlaceToRow(place, opts) {
-  // opts = { timestamp, country, city, category }
-  return [
-    opts.timestamp,                                   // timestamp
-    opts.country,                                     // country
-    opts.city,                                        // city
-    opts.category,                                    // category
-    place.name || "",                                 // business_name
-    place.formatted_phone_number || "",               // phone (puede venir vacío en textsearch)
-    place.formatted_address || place.vicinity || "",  // address
-    place.geometry?.location?.lat || "",              // lat
-    place.geometry?.location?.lng || "",              // lng
-    place.rating || "",                               // rating
-    place.place_id || "",                             // place_id
-    "Glow Places",                                    // source
-  ];
+// -------------------------------------------------
+// HELPER: normalizar teléfono (puede venir undefined)
+function safe(v) {
+  if (v === undefined || v === null) return "N/A";
+  if (v === "") return "N/A";
+  return v;
 }
 
-// ------------------------------------------------------------
-// ENDPOINT: /places/city-search
-// ------------------------------------------------------------
-// Busca en Google Places usando "category city country"
-// Ejemplo de body:
+// -------------------------------------------------
+// RUTA 1: Buscar negocios por CIUDAD COMPLETA
+// POST /places/search-city
+//
+// Body que enviamos:
 // {
-//   "city": "Bogotá",
-//   "country": "Colombia",
+//   "city": "Bogotá, Colombia",
 //   "category": "barberías"
 // }
 //
-// Respuesta:
-// {
-//   "status": "success",
-//   "tab_name": "Bogotá",
-//   "rows": [
-//      ["2025-10-31T16:40:00Z","Colombia","Bogotá","barberías","Barber Shop Titan","+57 ...","Cra 13 # 88-20, Bogotá","4.5","4.676","-74.058","ChIJxxxxID","Glow Places"],
-//      ...
-//   ]
-// }
+// Lo que hace:
+// - arma el query: `${category} ${city}`
+// - llama a Google Places Text Search (búsqueda por texto)
+// - retorna lista con datos limpios
 //
-app.post("/places/city-search", async (req, res) => {
+app.post("/places/search-city", async (req, res) => {
   try {
-    const { city, country, category } = req.body;
+    const { city, category } = req.body;
 
-    if (!city || !country || !category) {
-      return res
-        .status(400)
-        .json({ error: "city, country y category son requeridos" });
+    if (!city || !category) {
+      return res.status(400).json({
+        error: "Falta 'city' o 'category' en el body. Ej: { city:'Bogotá, Colombia', category:'barberías' }"
+      });
     }
 
-    const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-    if (!GOOGLE_API_KEY) {
-      return res
-        .status(500)
-        .json({ error: "Falta GOOGLE_API_KEY en environment variables" });
-    }
+    // query tipo: "barberías Bogotá, Colombia"
+    const query = `${category} ${city}`;
 
-    // Ejemplo de query: "barberías Bogotá Colombia"
-    const query = `${category} ${city} ${country}`;
-
+    // Llamada a Google Places Text Search
+    // Importante: agregamos fields tipo "business_status", "geometry", etc.
     const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(
       query
     )}&key=${GOOGLE_API_KEY}`;
 
-    // Node 22+ ya trae fetch global
     const r = await fetch(url);
     const data = await r.json();
 
-    const timestamp = new Date().toISOString();
-
-    // Mapear cada resultado de Google Places a la fila esperada por Sheets
-    const rows = (data.results || []).map((place) =>
-      mapPlaceToRow(place, {
-        timestamp,
-        country,
+    if (!data.results) {
+      return res.json({
+        status: "ok",
         city,
         category,
-      })
-    );
+        count: 0,
+        results: []
+      });
+    }
 
-    return res.json({
-      status: "success",
-      tab_name: city, // nombre de la pestaña del Sheet donde van estas filas
-      rows,
-      raw_count: rows.length,
+    // Mapeamos resultados
+    const cleaned = data.results.map((place, idx) => {
+      return {
+        idx: idx + 1,
+        name: safe(place.name),
+        address: safe(place.formatted_address),
+        lat: place.geometry?.location?.lat ?? null,
+        lng: place.geometry?.location?.lng ?? null,
+        rating: place.rating ?? null,
+        user_ratings_total: place.user_ratings_total ?? null,
+        place_id: safe(place.place_id),
+        source: "Glow Places",
+        // teléfono directo no viene en textsearch, se puede pedir luego en /places/details
+        phone: "N/A"
+      };
     });
-  } catch (err) {
-    console.error("city-search error:", err);
-    return res.status(500).json({
-      error: err.message || "Error interno en /places/city-search",
+
+    res.json({
+      status: "ok",
+      city,
+      category,
+      count: cleaned.length,
+      results: cleaned
     });
+  } catch (e) {
+    console.error("search-city error:", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ------------------------------------------------------------
-// ENDPOINT: /sheets/append
-// ------------------------------------------------------------
-// Inserta filas en una pestaña específica del Google Sheet.
+// -------------------------------------------------
+// OPCIONAL EXTRA: Obtener detalles de un place_id concreto
+// (teléfono, website, horarios, etc.)
+// POST /places/details
+//
+// Body:
+// { "place_id": "XXXXX" }
+//
+app.post("/places/details", async (req, res) => {
+  try {
+    const { place_id } = req.body;
+    if (!place_id) {
+      return res.status(400).json({ error: "Falta place_id" });
+    }
+
+    const detailsUrl = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${encodeURIComponent(
+      place_id
+    )}&fields=name,formatted_address,international_phone_number,website,geometry,opening_hours,types&key=${GOOGLE_API_KEY}`;
+
+    const r = await fetch(detailsUrl);
+    const d = await r.json();
+
+    res.json({
+      status: "ok",
+      place_id,
+      details: d.result || {}
+    });
+  } catch (e) {
+    console.error("details error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// -------------------------------------------------
+// RUTA 2: Guardar filas en Google Sheets
+// POST /sheets/append
+//
 // Body esperado:
 // {
-//   "tab_name": "Bogotá",
+//   "city": "Bogotá, Colombia",
 //   "rows": [
-//      ["2025-10-31T16:40:00Z","Colombia","Bogotá","barberías","Barber Shop Titan","+57 ...","Cra 13 # 88-20, Bogotá","4.5","4.676","-74.058","ChIJxxxxID","Glow Places"],
+//      {
+//        "timestamp": "2025-10-31T12:30:00Z",
+//        "country": "Colombia",
+//        "city": "Bogotá",
+//        "category": "barberías",
+//        "name": "Barbería Ejemplo",
+//        "phone": "+57 123 456",
+//        "website": "N/A",
+//        "lat": 4.6,
+//        "lng": -74.08,
+//        "address": "Calle 123 #4-56, Bogotá, Colombia",
+//        "place_id": "xxxxx",
+//        "source": "Glow Places"
+//      },
 //      ...
 //   ]
 // }
 //
-// IMPORTANTE: la pestaña (sheet/tab) "Bogotá" DEBE existir ya, y la fila 1 de esa pestaña
-// debe tener exactamente estas columnas:
+// Qué hace:
+// - construye un array bidimensional [[],[],[]] para Sheets
+// - hace append al rango "Hoja 1!A2" (por ahora todos van ahí)
+//   (luego más adelante mejoramos para crear hoja por ciudad)
 //
-// timestamp | country | city | category | business_name | phone | address | lat | lng | rating | place_id | source
+// IMPORTANTE:
+// Antes de esto la hoja debe tener encabezados en A1, B1, C1...
+// Ej:
+// timestamp | country | city | category | name | phone | website | lat | lng | address | place_id | source
 //
 app.post("/sheets/append", async (req, res) => {
   try {
-    if (!sheetsClient || !sheetsAuth) {
-      return res.status(500).json({
+    const { city, rows } = req.body;
+
+    if (!rows || !Array.isArray(rows) || rows.length === 0) {
+      return res.status(400).json({
         error:
-          "Google Sheets client no inicializado. Revisa GOOGLE_SERVICE_ACCOUNT_JSON.",
+          "Falta 'rows' o está vacío. Debes mandar un array de objetos con los campos."
       });
     }
 
-    const { tab_name, rows } = req.body;
-    if (!tab_name || !rows || !Array.isArray(rows) || rows.length === 0) {
-      return res
-        .status(400)
-        .json({ error: "tab_name y rows son requeridos, rows no puede ser vacío" });
-    }
+    // Convertimos cada fila (obj) en un array ordenado de columnas
+    // Este orden debe coincidir con las columnas en tu Google Sheet
+    const values = rows.map((obj) => [
+      safe(obj.timestamp),
+      safe(obj.country),
+      safe(obj.city),
+      safe(obj.category),
+      safe(obj.name),
+      safe(obj.phone),
+      safe(obj.website),
+      obj.lat ?? "",
+      obj.lng ?? "",
+      safe(obj.address),
+      safe(obj.place_id),
+      safe(obj.source)
+    ]);
 
-    const SHEET_ID = process.env.SHEET_ID;
-    if (!SHEET_ID) {
-      return res
-        .status(500)
-        .json({ error: "Falta SHEET_ID en environment variables" });
-    }
+    const sheets = getSheetsClient();
 
-    // Ejemplo: "Bogotá!A1:L1" porque tenemos 12 columnas (A..L)
-    const range = `${tab_name}!A1:L1`;
+    // IMPORTANTE:
+    // Por ahora vamos a mandar todo a "Hoja 1", desde la columna A en adelante.
+    // range: "Hoja 1!A2" le dice "empezá a meter después del header"
+    const range = "Hoja 1!A2";
 
-    // Append en la pestaña
-    const response = await sheetsClient.spreadsheets.values.append({
+    const response = await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range,
       valueInputOption: "USER_ENTERED",
       insertDataOption: "INSERT_ROWS",
       requestBody: {
-        values: rows,
-      },
+        values
+      }
     });
 
-    return res.json({
+    res.json({
       status: "ok",
       updates: response.data.updates || null,
+      note: `Se agregaron ${values.length} filas a la hoja (ciudad: ${city}).`
     });
-  } catch (err) {
-    console.error("sheets append error:", err);
-    return res.status(500).json({
-      error: err.message || "Error interno en /sheets/append",
-    });
+  } catch (e) {
+    console.error("sheets append error:", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ------------------------------------------------------------
-// ENDPOINT OPCIONAL: /places/details (enriquecer datos)
-// ------------------------------------------------------------
-// Esto es opcional. Lo dejamos vivo por si más adelante querés
-// pedir más info (teléfono, horario, etc.) place por place_id.
-// Sigue el mismo patrón que tu versión anterior.
-//
-// Espera body:
-// { "place_ids": ["abc123", "xyz999", ...] }
-//
-// Devuelve un array con detalles básicos.
-//
-app.post("/places/details", async (req, res) => {
-  try {
-    const { place_ids } = req.body;
-    if (!Array.isArray(place_ids) || place_ids.length === 0) {
-      return res
-        .status(400)
-        .json({ error: "place_ids debe ser un array con al menos 1 id" });
-    }
-
-    const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-    if (!GOOGLE_API_KEY) {
-      return res
-        .status(500)
-        .json({ error: "Falta GOOGLE_API_KEY en environment variables" });
-    }
-
-    const detailsResults = [];
-
-    for (const pid of place_ids) {
-      const detailsUrl = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${encodeURIComponent(
-        pid
-      )}&fields=name,formatted_phone_number,formatted_address,geometry,website,rating,international_phone_number,opening_hours&key=${GOOGLE_API_KEY}`;
-
-      const r = await fetch(detailsUrl);
-      const data = await r.json();
-
-      detailsResults.push({
-        place_id: pid,
-        result: data.result || {},
-        status: data.status || "",
-      });
-    }
-
-    return res.json({
-      status: "success",
-      results: detailsResults,
-    });
-  } catch (err) {
-    console.error("places details error:", err);
-    return res.status(500).json({
-      error: err.message || "Error interno en /places/details",
-    });
-  }
-});
-
-// ------------------------------------------------------------
-// ENDPOINT: /openapi.json
-// ------------------------------------------------------------
-// Esto le dice al agente (MCP / custom tool) qué endpoints existen
-// y qué body debe mandar.
-//
-// MUY IMPORTANTE: Acá describimos /places/city-search y /sheets/append
-// con la nueva lógica.
-//
-app.get("/openapi.json", (req, res) => {
-  const publicUrl = process.env.PUBLIC_URL || "https://glow-market-hunter.onrender.com";
-
-  const spec = {
-    openapi: "3.0.0",
-    info: {
-      title: "Glow Market Hunter API",
-      version: "2.0.0",
-      description:
-        "API interna para buscar negocios por ciudad y guardar leads en Google Sheets por pestaña de ciudad.",
-    },
-    servers: [
-      {
-        url: publicUrl,
-      },
-    ],
-    paths: {
-      "/places/city-search": {
-        post: {
-          summary:
-            "Buscar negocios en una ciudad completa usando Google Places (por categoría + ciudad + país).",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    city: {
-                      type: "string",
-                      description: "Nombre de la ciudad. Ej: 'Bogotá'",
-                    },
-                    country: {
-                      type: "string",
-                      description: "Nombre del país. Ej: 'Colombia'",
-                    },
-                    category: {
-                      type: "string",
-                      description:
-                        "Tipo de negocio a buscar. Ej: 'barberías', 'spas', 'salones de belleza'.",
-                    },
-                  },
-                  required: ["city", "country", "category"],
-                },
-              },
-            },
-          },
-          responses: {
-            "200": {
-              description:
-                "OK. Devuelve tab_name (igual al nombre de la ciudad) y rows (listas listas para Google Sheets).",
-            },
-          },
-        },
-      },
-
-      "/sheets/append": {
-        post: {
-          summary:
-            "Insertar filas en la pestaña de ciudad correspondiente en Google Sheets.",
-          description:
-            "tab_name debe ser EXACTAMENTE el nombre de la pestaña en el Spreadsheet (ej: 'Bogotá'). rows debe ser un array de arrays alineado con las columnas.",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    tab_name: {
-                      type: "string",
-                      description:
-                        "Nombre de la pestaña del Sheet donde se van a insertar las filas. Ej: 'Bogotá'",
-                    },
-                    rows: {
-                      type: "array",
-                      items: {
-                        type: "array",
-                        items: {
-                          type: "string",
-                        },
-                      },
-                      description:
-                        "Cada fila debe seguir el orden: [timestamp, country, city, category, business_name, phone, address, lat, lng, rating, place_id, source]",
-                    },
-                  },
-                  required: ["tab_name", "rows"],
-                },
-              },
-            },
-          },
-          responses: {
-            "200": {
-              description:
-                "OK. Devuelve updates de Google Sheets con info de inserción.",
-            },
-          },
-        },
-      },
-
-      "/places/details": {
-        post: {
-          summary:
-            "Obtener detalles extra de un place_id (teléfono, horario, etc.).",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    place_ids: {
-                      type: "array",
-                      items: { type: "string" },
-                      description:
-                        "Lista de place_ids de Google Places para enriquecer datos (teléfono, horario, etc.).",
-                    },
-                  },
-                  required: ["place_ids"],
-                },
-              },
-            },
-          },
-          responses: {
-            "200": {
-              description:
-                "OK. Devuelve un array con detalles para cada place_id solicitado.",
-            },
-          },
-        },
-      },
-    },
-  };
-
-  res.json(spec);
-});
-
-// ------------------------------------------------------------
-// ENDPOINT raíz "/" -> healthcheck rápido
-// ------------------------------------------------------------
+// -------------------------------------------------
+// RUTA TEST SIMPLE
 app.get("/", (req, res) => {
-  res.send("✅ Glow Market Hunter API activa y funcionando (versión ciudad)");
+  res.send("Glow Market Hunter API lista (búsqueda por ciudad activa).");
 });
 
-// ------------------------------------------------------------
-// Start server
-// ------------------------------------------------------------
+// -------------------------------------------------
+// START SERVER
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Servidor activo en puerto ${PORT}`);
   console.log("Your service is live 🎉");
-  console.log(`Available at your primary URL (openapi): ${process.env.PUBLIC_URL || "https://glow-market-hunter.onrender.com"}/openapi.json`);
+  console.log("Available at your primary URL (openapi): /openapi.json?");
 });
