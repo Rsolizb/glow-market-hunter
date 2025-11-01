@@ -1,18 +1,17 @@
 {
   "name": "glow-market-hunter",
   "version": "1.0.0",
-  "description": "API interna de Glow para búsqueda de negocios por ciudad y guardado en Google Sheets",
+  "description": "API para buscar negocios por ciudad y guardar resultados en Google Sheets",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js"
   },
-  "engines": {
-    "node": ">=22.0.0"
-  },
   "dependencies": {
-    "cors": "^2.8.5",
     "express": "^4.19.2",
+    "body-parser": "^1.20.3",
+    "cors": "^2.8.5",
+    "node-fetch": "^3.3.2",
     "googleapis": "^131.0.0"
   }
 }
