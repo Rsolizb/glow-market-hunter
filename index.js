@@ -9,14 +9,14 @@ import { google } from "googleapis";
    ========================= */
 const PORT = process.env.PORT || 10000;
 
-const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY; // <- ya lo tenías en Render
-const SHEET_ID       = process.env.SHEET_ID;       // <- ya lo tenías en Render
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const SHEET_ID       = process.env.SHEET_ID;
 const SERVICE_JSON   = process.env.GOOGLE_SERVICE_ACCOUNT_JSON
   ? JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON)
   : null;
 
 if (!GOOGLE_API_KEY || !SHEET_ID || !SERVICE_JSON) {
-  console.error("Faltan variables de entorno requeridas: GOOGLE_API_KEY, SHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON");
+  console.error("Faltan variables de entorno: GOOGLE_API_KEY, SHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON");
   process.exit(1);
 }
 
@@ -31,30 +31,38 @@ const auth = new google.auth.JWT({
 const sheets = google.sheets({ version: "v4", auth });
 
 /* =========================
-   HELPERS
+   APP
    ========================= */
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// Google Places Text Search con paginación (fetch ALL)
+/* =========================
+   HELPERS
+   ========================= */
+
+// 1) Text Search con paginación (trae TODO)
 async function fetchAllTextSearch(query) {
   const base = "https://maps.googleapis.com/maps/api/place/textsearch/json";
   let url = `${base}?query=${encodeURIComponent(query)}&key=${GOOGLE_API_KEY}`;
-  let out = [];
-  let pageCount = 0;
+  let all = [];
+  let pages = 0;
 
-  while (url && pageCount < 10) {
+  while (url && pages < 10) {
     const r = await fetch(url);
-    if (!r.ok) throw new Error(`Places error: ${r.status} ${await r.text()}`);
+    if (!r.ok) throw new Error(`Places TextSearch error: ${r.status} ${await r.text()}`);
     const data = await r.json();
 
-    if (data.status && data.status !== "OK" && data.status !== "ZERO_RESULTS" && data.status !== "OVER_QUERY_LIMIT") {
-      throw new Error(`Places status: ${data.status} / ${data.error_message || ""}`);
+    // estados aceptables
+    if (
+      data.status &&
+      !["OK", "ZERO_RESULTS", "OVER_QUERY_LIMIT"].includes(data.status)
+    ) {
+      throw new Error(`Places TextSearch status: ${data.status} / ${data.error_message || ""}`);
     }
 
     if (Array.isArray(data.results)) {
-      out = out.concat(
+      all = all.concat(
         data.results.map(x => ({
           place_id: x.place_id || null,
           name: x.name || "",
@@ -62,34 +70,87 @@ async function fetchAllTextSearch(query) {
           lat: x.geometry?.location?.lat ?? "",
           lng: x.geometry?.location?.lng ?? "",
           rating: x.rating ?? "",
-          website: "", // opcional (se puede ampliar con Place Details si lo necesitas)
           source: "Glow Places",
         }))
       );
     }
 
-    // paginación
     if (data.next_page_token) {
-      // Google pide ~2s antes de usar el next_page_token
-      await new Promise(res => setTimeout(res, 2000));
+      await new Promise(res => setTimeout(res, 2000)); // regla de Google
       url = `${base}?pagetoken=${data.next_page_token}&key=${GOOGLE_API_KEY}`;
-      pageCount += 1;
+      pages += 1;
     } else {
       url = null;
     }
   }
+  return all;
+}
+
+// 2) Place Details por place_id (para phone / website)
+async function fetchPlaceDetails(placeId) {
+  const fields = [
+    "formatted_phone_number",
+    "international_phone_number",
+    "website"
+  ].join(",");
+
+  const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${encodeURIComponent(
+    placeId
+  )}&fields=${fields}&key=${GOOGLE_API_KEY}`;
+
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Place Details error: ${r.status} ${await r.text()}`);
+  const data = await r.json();
+
+  if (data.status && !["OK", "ZERO_RESULTS"].includes(data.status)) {
+    // Si rate limit u otro, devolvemos vacío y seguimos
+    return { phone: "", website: "" };
+  }
+
+  const d = data.result || {};
+  const phone =
+    d.international_phone_number ||
+    d.formatted_phone_number ||
+    "";
+
+  const website = d.website || "";
+  return { phone, website };
+}
+
+// 3) Enriquecer con details con un pequeño control de concurrencia
+async function enrichWithDetails(rows, concurrency = 5) {
+  const out = [];
+  let i = 0;
+
+  async function worker() {
+    while (i < rows.length) {
+      const idx = i++;
+      const item = rows[idx];
+      if (!item.place_id) {
+        out[idx] = { ...item, phone: "", website: "" };
+        continue;
+      }
+      try {
+        const det = await fetchPlaceDetails(item.place_id);
+        out[idx] = { ...item, phone: det.phone, website: det.website };
+      } catch {
+        out[idx] = { ...item, phone: "", website: "" };
+      }
+    }
+  }
+
+  const workers = Array.from({ length: concurrency }, () => worker());
+  await Promise.all(workers);
   return out;
 }
 
-// Escribe filas a una pestaña (crea encabezados fijos si no existen)
+// 4) Escribir a Sheets (headers fijos)
 async function appendRows(sheetName, rows) {
-  // Encabezados fijos
   const headers = [
     "timestamp", "country", "city", "zone", "query",
     "name", "phone", "website", "lat", "lng", "address", "place_id", "source"
   ];
 
-  // Asegurar fila de headers
   await sheets.spreadsheets.values.update({
     spreadsheetId: SHEET_ID,
     range: `'${sheetName}'!A1:M1`,
@@ -97,7 +158,7 @@ async function appendRows(sheetName, rows) {
     requestBody: { values: [headers] },
   });
 
-  if (!rows.length) return { updates: null };
+  if (!rows.length) return;
 
   const values = rows.map(r => ([
     new Date().toISOString(),
@@ -115,15 +176,13 @@ async function appendRows(sheetName, rows) {
     r.source || ""
   ]));
 
-  const res = await sheets.spreadsheets.values.append({
+  await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
     range: `'${sheetName}'!A2`,
     valueInputOption: "USER_ENTERED",
     insertDataOption: "INSERT_ROWS",
     requestBody: { values },
   });
-
-  return res.data;
 }
 
 /* =========================
@@ -133,11 +192,10 @@ async function appendRows(sheetName, rows) {
 // Health
 app.get("/", (_req, res) => res.send("Glow Market Hunter API activa 🚀"));
 
-// Busca por ciudad y categorías, deduplica, guarda y DEVUELVE la lista
+// Corre una ciudad, deduplica por place_id, enriquece con phone & website y guarda
 app.post("/run-city", async (req, res) => {
   try {
     const { country, city, categories } = req.body || {};
-
     if (!country || !city) {
       return res.status(400).json({ error: "Faltan 'country' y/o 'city'." });
     }
@@ -146,29 +204,26 @@ app.post("/run-city", async (req, res) => {
       ? categories
       : ["barberías", "salones de belleza", "spas"];
 
-    const sheetName = city; // una pestaña por ciudad
-
-    let totalFound = 0;
-    let totalAdded = 0;
+    const sheetName = city;
     const perCategory = [];
-    const map = new Map(); // place_id -> row
+    const map = new Map(); // place_id => row base
+    let totalFound = 0;
 
     for (const cat of cats) {
       const query = `${cat} ${city} ${country}`;
       const list = await fetchAllTextSearch(query);
       totalFound += list.length;
 
-      // dedupe por place_id global de la corrida
       for (const it of list) {
         if (it.place_id && !map.has(it.place_id)) {
           map.set(it.place_id, {
             country,
             city,
-            zone: "",      // lo dejamos vacío por ahora
-            query,         // guardo el query exacto
+            zone: "",
+            query,
             name: it.name,
-            phone: "",     // se puede ampliar con Place Details
-            website: it.website || "",
+            phone: "",
+            website: "",
             lat: it.lat,
             lng: it.lng,
             address: it.address,
@@ -177,33 +232,37 @@ app.post("/run-city", async (req, res) => {
           });
         }
       }
-
       perCategory.push({ category: cat, found: list.length });
     }
 
+    // base sin duplicados
     const uniqueRows = Array.from(map.values());
 
-    // Append a Sheets
-    const result = await appendRows(sheetName, uniqueRows);
-    const added = uniqueRows.length;
-    totalAdded += added;
+    // Enriquecer con phone + website (Place Details)
+    const enriched = await enrichWithDetails(uniqueRows, 5);
 
-    // Para que el agente pueda MOSTRAR en chat:
-    // entregamos una lista liviana (máx. 100 para no saturar tokens)
-    const results = uniqueRows
-      .slice(0, 100)
-      .map(r => ({ name: r.name, address: r.address, place_id: r.place_id }));
+    // Guardar a Sheets
+    await appendRows(sheetName, enriched);
+
+    // Vista previa para el agente (hasta 100 filas)
+    const preview = enriched.slice(0, 100).map(r => ({
+      name: r.name,
+      address: r.address,
+      place_id: r.place_id,
+      phone: r.phone,
+      website: r.website
+    }));
 
     return res.json({
       status: "ok",
       sheetName,
       total_found: totalFound,
       total_unique: uniqueRows.length,
-      total_appended: added,
-      per_category: perCategory.map(c => ({ ...c, added })), // nota: agregado global; puedes refinar por cat si prefieres
-      results_count: results.length,
-      results, // <-- el agente mostrará esto en tabla (name, address, place_id)
-      note: "Pestaña creada/actualizada con nombre de la ciudad. Se devuelven hasta 100 resultados para vista previa."
+      total_appended: enriched.length,
+      per_category: perCategory,
+      results_count: preview.length,
+      results: preview,
+      note: "Se guardó todo en la pestaña de la ciudad y se devolvió una vista previa de hasta 100 filas con phone y website."
     });
   } catch (e) {
     console.error("run-city error:", e);
