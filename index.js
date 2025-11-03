@@ -1,343 +1,216 @@
-// index.js
 import express from "express";
-import bodyParser from "body-parser";
 import cors from "cors";
+import bodyParser from "body-parser";
 import fetch from "node-fetch";
 import { google } from "googleapis";
 
-// ============================
-// Config básica
-// ============================
+/* =========================
+   CONFIG
+   ========================= */
+const PORT = process.env.PORT || 10000;
+
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY; // <- ya lo tenías en Render
+const SHEET_ID       = process.env.SHEET_ID;       // <- ya lo tenías en Render
+const SERVICE_JSON   = process.env.GOOGLE_SERVICE_ACCOUNT_JSON
+  ? JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON)
+  : null;
+
+if (!GOOGLE_API_KEY || !SHEET_ID || !SERVICE_JSON) {
+  console.error("Faltan variables de entorno requeridas: GOOGLE_API_KEY, SHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON");
+  process.exit(1);
+}
+
+/* =========================
+   GOOGLE SHEETS AUTH
+   ========================= */
+const auth = new google.auth.JWT({
+  email: SERVICE_JSON.client_email,
+  key: SERVICE_JSON.private_key,
+  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+});
+const sheets = google.sheets({ version: "v4", auth });
+
+/* =========================
+   HELPERS
+   ========================= */
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-const PORT = process.env.PORT || 10000;
-const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-const SHEET_ID = process.env.SHEET_ID;
+// Google Places Text Search con paginación (fetch ALL)
+async function fetchAllTextSearch(query) {
+  const base = "https://maps.googleapis.com/maps/api/place/textsearch/json";
+  let url = `${base}?query=${encodeURIComponent(query)}&key=${GOOGLE_API_KEY}`;
+  let out = [];
+  let pageCount = 0;
 
-// Servicio Google (account JSON en env var)
-function getSheetsClient() {
-  if (!process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-    throw new Error("Falta GOOGLE_SERVICE_ACCOUNT_JSON en variables de entorno.");
-  }
-  const svc = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-  const jwt = new google.auth.JWT(
-    svc.client_email,
-    null,
-    svc.private_key,
-    ["https://www.googleapis.com/auth/spreadsheets"]
-  );
-  return google.sheets({ version: "v4", auth: jwt });
-}
+  while (url && pageCount < 10) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`Places error: ${r.status} ${await r.text()}`);
+    const data = await r.json();
 
-// Encabezados fijos
-const HEADERS = [
-  "timestamp",
-  "country",
-  "city",
-  "query",
-  "category",
-  "name",
-  "phone",
-  "website",
-  "lat",
-  "lng",
-  "address",
-  "place_id",
-  "source"
-];
-// Índice (1-based) de place_id para lecturas
-const PLACE_ID_COL_A1 = "L"; // Columna 12 (A=1 ... L=12)
+    if (data.status && data.status !== "OK" && data.status !== "ZERO_RESULTS" && data.status !== "OVER_QUERY_LIMIT") {
+      throw new Error(`Places status: ${data.status} / ${data.error_message || ""}`);
+    }
 
-// ============================
-// Utilidades Sheets
-// ============================
-async function ensureSheetAndHeader(sheets, sheetId, sheetName) {
-  const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
-  const exists = meta.data.sheets?.some(s => s.properties?.title === sheetName);
+    if (Array.isArray(data.results)) {
+      out = out.concat(
+        data.results.map(x => ({
+          place_id: x.place_id || null,
+          name: x.name || "",
+          address: x.formatted_address || "",
+          lat: x.geometry?.location?.lat ?? "",
+          lng: x.geometry?.location?.lng ?? "",
+          rating: x.rating ?? "",
+          website: "", // opcional (se puede ampliar con Place Details si lo necesitas)
+          source: "Glow Places",
+        }))
+      );
+    }
 
-  if (!exists) {
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId: sheetId,
-      requestBody: {
-        requests: [{ addSheet: { properties: { title: sheetName } } }]
-      }
-    });
-    // Poner headers
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: sheetId,
-      range: `${sheetName}!A1:${String.fromCharCode(64 + HEADERS.length)}1`,
-      valueInputOption: "USER_ENTERED",
-      requestBody: { values: [HEADERS] }
-    });
-  } else {
-    // Asegurar headers en A1 si están vacíos
-    const hdr = await sheets.spreadsheets.values.get({
-      spreadsheetId: sheetId,
-      range: `${sheetName}!A1:${String.fromCharCode(64 + HEADERS.length)}1`
-    });
-    const row0 = hdr.data.values?.[0] || [];
-    if (row0.length === 0) {
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: sheetId,
-        range: `${sheetName}!A1:${String.fromCharCode(64 + HEADERS.length)}1`,
-        valueInputOption: "USER_ENTERED",
-        requestBody: { values: [HEADERS] }
-      });
+    // paginación
+    if (data.next_page_token) {
+      // Google pide ~2s antes de usar el next_page_token
+      await new Promise(res => setTimeout(res, 2000));
+      url = `${base}?pagetoken=${data.next_page_token}&key=${GOOGLE_API_KEY}`;
+      pageCount += 1;
+    } else {
+      url = null;
     }
   }
+  return out;
 }
 
-async function readExistingPlaceIds(sheets, sheetId, sheetName) {
-  try {
-    const resp = await sheets.spreadsheets.values.get({
-      spreadsheetId: sheetId,
-      range: `${sheetName}!${PLACE_ID_COL_A1}2:${PLACE_ID_COL_A1}`
-    });
-    const rows = resp.data.values || [];
-    const set = new Set(rows.map(r => (r[0] || "").trim()).filter(Boolean));
-    return set;
-  } catch {
-    return new Set();
-  }
-}
+// Escribe filas a una pestaña (crea encabezados fijos si no existen)
+async function appendRows(sheetName, rows) {
+  // Encabezados fijos
+  const headers = [
+    "timestamp", "country", "city", "zone", "query",
+    "name", "phone", "website", "lat", "lng", "address", "place_id", "source"
+  ];
 
-async function appendRows(sheets, sheetId, sheetName, rows) {
-  if (!rows.length) return { appended: 0 };
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: sheetId,
-    range: `${sheetName}!A1`,
+  // Asegurar fila de headers
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: `'${sheetName}'!A1:M1`,
+    valueInputOption: "RAW",
+    requestBody: { values: [headers] },
+  });
+
+  if (!rows.length) return { updates: null };
+
+  const values = rows.map(r => ([
+    new Date().toISOString(),
+    r.country || "",
+    r.city || "",
+    r.zone || "",
+    r.query || "",
+    r.name || "",
+    r.phone || "",
+    r.website || "",
+    r.lat || "",
+    r.lng || "",
+    r.address || "",
+    r.place_id || "",
+    r.source || ""
+  ]));
+
+  const res = await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: `'${sheetName}'!A2`,
     valueInputOption: "USER_ENTERED",
     insertDataOption: "INSERT_ROWS",
-    requestBody: { values: rows }
-  });
-  return { appended: rows.length };
-}
-
-// ============================
-// Utilidades Places API
-// ============================
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-// Text Search con paginación sin límite
-async function textSearchAll(query, language = "es") {
-  const base = "https://maps.googleapis.com/maps/api/place/textsearch/json";
-  const params = new URLSearchParams({
-    query,
-    key: GOOGLE_API_KEY,
-    language
+    requestBody: { values },
   });
 
-  let url = `${base}?${params.toString()}`;
-  const all = [];
-
-  while (true) {
-    const r = await fetch(url);
-    const data = await r.json();
-    if (data.status !== "OK" && data.status !== "ZERO_RESULTS") {
-      console.error("TextSearch status:", data.status, data.error_message);
-    }
-    all.push(...(data.results || []));
-    if (!data.next_page_token) break;
-    // política de Google: esperar ~2s antes de usar next_page_token
-    await sleep(2200);
-    url = `${base}?pagetoken=${data.next_page_token}&key=${GOOGLE_API_KEY}`;
-  }
-  return all;
+  return res.data;
 }
 
-// Place Details para enriquecer
-async function getPlaceDetails(place_id) {
-  const base = "https://maps.googleapis.com/maps/api/place/details/json";
-  const fields = [
-    "place_id",
-    "name",
-    "formatted_address",
-    "formatted_phone_number",
-    "website",
-    "geometry/location"
-  ].join(",");
-  const params = new URLSearchParams({
-    place_id,
-    key: GOOGLE_API_KEY,
-    fields
-  });
-  const r = await fetch(`${base}?${params.toString()}`);
-  const data = await r.json();
-  if (data.status !== "OK") return null;
-  return data.result;
-}
+/* =========================
+   ENDPOINTS
+   ========================= */
 
-// ============================
-// Endpoint raíz sanity
-// ============================
-app.get("/", (req, res) => {
-  res.send("Your service is live 🎉");
-});
+// Health
+app.get("/", (_req, res) => res.send("Glow Market Hunter API activa 🚀"));
 
-// ============================
-// ORQUESTADOR: /run-city
-// ============================
-// Body esperado:
-// {
-//   "country": "Bolivia",
-//   "city": "Santa Cruz de la Sierra",
-//   "categories": ["barberías","salones de belleza","spas"],          // opcional (default)
-//   "sheetId": "SHEET_ID"                                            // opcional (si no, usa env)
-//   "language": "es"                                                 // opcional
-// }
+// Busca por ciudad y categorías, deduplica, guarda y DEVUELVE la lista
 app.post("/run-city", async (req, res) => {
   try {
-    const {
-      country = "",
-      city = "",
-      categories = ["barberías", "salones de belleza", "spas"],
-      sheetId,
-      language = "es"
-    } = req.body || {};
+    const { country, city, categories } = req.body || {};
 
-    if (!GOOGLE_API_KEY) {
-      return res.status(400).json({ error: "Falta GOOGLE_API_KEY." });
-    }
-    const targetSheetId = sheetId || SHEET_ID;
-    if (!targetSheetId) {
-      return res.status(400).json({ error: "Falta sheetId en body o SHEET_ID en env." });
-    }
     if (!country || !city) {
-      return res.status(400).json({ error: "Debes enviar country y city." });
+      return res.status(400).json({ error: "Faltan 'country' y/o 'city'." });
     }
 
-    const sheets = getSheetsClient();
-    const sheetName = city.trim(); // cada ciudad en su pestaña
-    await ensureSheetAndHeader(sheets, targetSheetId, sheetName);
-    const existingIds = await readExistingPlaceIds(sheets, targetSheetId, sheetName);
+    const cats = Array.isArray(categories) && categories.length
+      ? categories
+      : ["barberías", "salones de belleza", "spas"];
 
-    const nowISO = new Date().toISOString();
-    const source = "Glow Places";
+    const sheetName = city; // una pestaña por ciudad
 
-    const summary = [];
-    const appendedRows = [];
+    let totalFound = 0;
+    let totalAdded = 0;
+    const perCategory = [];
+    const map = new Map(); // place_id -> row
 
-    for (const category of categories) {
-      const query = `${category} ${city} ${country}`;
-      const results = await textSearchAll(query, language);
-      let added = 0;
+    for (const cat of cats) {
+      const query = `${cat} ${city} ${country}`;
+      const list = await fetchAllTextSearch(query);
+      totalFound += list.length;
 
-      for (const r of results) {
-        const pid = r.place_id;
-        if (!pid || existingIds.has(pid)) continue;
-
-        // details
-        const det = await getPlaceDetails(pid);
-        const phone = det?.formatted_phone_number || "";
-        const website = det?.website || "";
-        const lat = det?.geometry?.location?.lat ?? r.geometry?.location?.lat ?? "";
-        const lng = det?.geometry?.location?.lng ?? r.geometry?.location?.lng ?? "";
-        const address = det?.formatted_address || r.formatted_address || "";
-        const name = det?.name || r.name || "";
-
-        const row = [
-          nowISO,
-          country,
-          city,
-          query,
-          category,
-          name,
-          phone,
-          website,
-          lat,
-          lng,
-          address,
-          pid,
-          source
-        ];
-        appendedRows.push(row);
-        existingIds.add(pid); // evitar duplicar dentro de la misma corrida
-        added++;
+      // dedupe por place_id global de la corrida
+      for (const it of list) {
+        if (it.place_id && !map.has(it.place_id)) {
+          map.set(it.place_id, {
+            country,
+            city,
+            zone: "",      // lo dejamos vacío por ahora
+            query,         // guardo el query exacto
+            name: it.name,
+            phone: "",     // se puede ampliar con Place Details
+            website: it.website || "",
+            lat: it.lat,
+            lng: it.lng,
+            address: it.address,
+            place_id: it.place_id,
+            source: it.source,
+          });
+        }
       }
 
-      summary.push({
-        category,
-        found: results.length,
-        added
-      });
+      perCategory.push({ category: cat, found: list.length });
     }
 
-    if (appendedRows.length) {
-      await appendRows(sheets, targetSheetId, sheetName, appendedRows);
-    }
+    const uniqueRows = Array.from(map.values());
+
+    // Append a Sheets
+    const result = await appendRows(sheetName, uniqueRows);
+    const added = uniqueRows.length;
+    totalAdded += added;
+
+    // Para que el agente pueda MOSTRAR en chat:
+    // entregamos una lista liviana (máx. 100 para no saturar tokens)
+    const results = uniqueRows
+      .slice(0, 100)
+      .map(r => ({ name: r.name, address: r.address, place_id: r.place_id }));
 
     return res.json({
       status: "ok",
-      sheetId: targetSheetId,
       sheetName,
-      total_appended: appendedRows.length,
-      per_category: summary,
-      note:
-        "Pestaña creada/actualizada con nombre de la ciudad. Filas agregadas con headers fijos. Deduplicado por place_id."
+      total_found: totalFound,
+      total_unique: uniqueRows.length,
+      total_appended: added,
+      per_category: perCategory.map(c => ({ ...c, added })), // nota: agregado global; puedes refinar por cat si prefieres
+      results_count: results.length,
+      results, // <-- el agente mostrará esto en tabla (name, address, place_id)
+      note: "Pestaña creada/actualizada con nombre de la ciudad. Se devuelven hasta 100 resultados para vista previa."
     });
   } catch (e) {
     console.error("run-city error:", e);
-    return res.status(500).json({ error: e.message || "Error interno" });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-// ============================
-// (Opcional) Endpoints previos
-// ============================
-// Los dejamos por compatibilidad con tus pruebas antiguas:
-app.post("/places/search-city", async (req, res) => {
-  try {
-    const { country = "", city = "", category = "", language = "es" } = req.body || {};
-    if (!country || !city || !category) {
-      return res.status(400).json({ error: "Debes enviar country, city y category." });
-    }
-    const query = `${category} ${city} ${country}`;
-    const results = await textSearchAll(query, language);
-    return res.json({ count: results.length, results });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Error en search-city" });
-  }
-});
-
-app.post("/sheets/append", async (req, res) => {
-  try {
-    const { sheetId, sheetName, rows } = req.body || {};
-    if (!sheetId || !sheetName) {
-      return res.status(400).json({ error: "Falta sheetId o sheetName." });
-    }
-    const sheets = getSheetsClient();
-    await ensureSheetAndHeader(sheets, sheetId, sheetName);
-    const existingIds = await readExistingPlaceIds(sheets, sheetId, sheetName);
-
-    // rows esperadas como array de objetos con las keys de HEADERS (o array de arrays ya ordenado)
-    let values = [];
-    if (Array.isArray(rows) && rows.length && !Array.isArray(rows[0])) {
-      // objetos -> a arrays (y dedup por place_id)
-      for (const o of rows) {
-        const pid = (o.place_id || "").trim();
-        if (!pid || existingIds.has(pid)) continue;
-        values.push(HEADERS.map(h => o[h] ?? ""));
-        existingIds.add(pid);
-      }
-    } else if (Array.isArray(rows) && rows.length) {
-      // ya son arrays -> opcionalmente podrías deduplicar aquí si conoces la columna L
-      values = rows;
-    }
-
-    const out = await appendRows(getSheetsClient(), sheetId, sheetName, values);
-    res.json({ status: "ok", appended: out.appended });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Error en sheets/append" });
-  }
-});
-
-// ============================
-// Start
-// ============================
 app.listen(PORT, () => {
   console.log(`Servidor activo en puerto ${PORT}`);
   console.log("Your service is live 🎉");
