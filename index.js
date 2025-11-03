@@ -16,13 +16,13 @@ const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 const SERVICE_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 const SHEET_ID = process.env.SHEET_ID;
 
-// Paginación de Text Search: Google pide ~2s entre páginas
+// Paginación de Text Search
 const NEXT_PAGE_DELAY_MS = 2000;
 
-// Concurrencia de Place Details para no saturar la cuota
+// Concurrencia de Place Details
 const DETAILS_CONCURRENCY = 5;
 
-// Tamaño de bloque al escribir en Sheets (filas por append)
+// Append en bloques
 const SHEETS_APPEND_CHUNK = 300;
 
 const SHEET_HEADERS = [
@@ -70,7 +70,7 @@ async function ensureCitySheet(sheets, spreadsheetId, cityTitle) {
     });
   }
 
-  // Escribimos headers siempre en A1 (idempotente)
+  // Headers en A1 (idempotente)
   await sheets.spreadsheets.values.update({
     spreadsheetId,
     range: `'${cityTitle}'!A1:${columnLetter(SHEET_HEADERS.length)}1`,
@@ -79,8 +79,22 @@ async function ensureCitySheet(sheets, spreadsheetId, cityTitle) {
   });
 }
 
+// Lee los place_id existentes (y los mantiene en un Set)
+async function getExistingPlaceIds(sheets, spreadsheetId, cityTitle) {
+  const colIndex = SHEET_HEADERS.indexOf("place_id"); // 0-based
+  const colLetter = columnLetter(colIndex + 1);
+  const range = `'${cityTitle}'!${colLetter}2:${colLetter}`;
+  const r = await sheets.spreadsheets.values.get({ spreadsheetId, range });
+  const vals = r.data.values || [];
+  const set = new Set();
+  for (const row of vals) {
+    const v = (row[0] || "").trim();
+    if (v) set.add(v);
+  }
+  return set;
+}
+
 async function appendRowsToSheet(sheets, spreadsheetId, cityTitle, rows) {
-  // Google acepta matrices grandes, pero mejor trocear para estabilidad
   for (let i = 0; i < rows.length; i += SHEETS_APPEND_CHUNK) {
     const chunk = rows.slice(i, i + SHEETS_APPEND_CHUNK);
     const values = chunk.map((r) => SHEET_HEADERS.map((h) => r[h] ?? ""));
@@ -115,7 +129,6 @@ async function textSearchAllPages(query) {
   url.searchParams.set("key", GOOGLE_API_KEY);
 
   let all = [];
-  let page = 1;
 
   while (true) {
     const r = await fetch(url.toString());
@@ -132,15 +145,11 @@ async function textSearchAllPages(query) {
     const token = data.next_page_token;
     if (!token) break;
 
-    // Esperar para que el token sea válido
     await waitMs(NEXT_PAGE_DELAY_MS);
 
-    // Siguiente página
     url = new URL("https://maps.googleapis.com/maps/api/place/textsearch/json");
     url.searchParams.set("pagetoken", token);
     url.searchParams.set("key", GOOGLE_API_KEY);
-
-    page++;
   }
 
   return all;
@@ -202,6 +211,35 @@ async function mapWithConcurrency(items, limit, mapper) {
 }
 
 /* =========================
+   Deduplicación
+========================= */
+function normalizeKey(s) {
+  return (s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildRow(timestamp, country, cityOnly, cat, p) {
+  return {
+    timestamp,
+    country,
+    city: cityOnly,
+    category: cat,
+    name: p?.name || "N/A",
+    phone: p?.phone || "N/A",
+    website: p?.website || "N/A",
+    lat: p?.lat ?? "",
+    lng: p?.lng ?? "",
+    address: p?.address || "N/A",
+    place_id: p?.place_id || "N/A",
+    source: "Glow Places",
+  };
+}
+
+/* =========================
    Endpoints
 ========================= */
 app.get("/", (req, res) => {
@@ -218,9 +256,7 @@ app.get("/", (req, res) => {
 app.post("/search-and-append", async (req, res) => {
   try {
     const { city, category, categories } = req.body || {};
-    if (!city) {
-      return res.status(400).json({ error: "Falta 'city'." });
-    }
+    if (!city) return res.status(400).json({ error: "Falta 'city'." });
 
     const cats = Array.isArray(categories)
       ? categories
@@ -236,18 +272,23 @@ app.post("/search-and-append", async (req, res) => {
     const tabTitle = city.trim();
     await ensureCitySheet(sheets, SHEET_ID, tabTitle);
 
+    // Set de place_id ya existentes en la hoja
+    const existingPlaceIds = await getExistingPlaceIds(
+      sheets,
+      SHEET_ID,
+      tabTitle
+    );
+
     const { city: cityOnly, country } = splitCityCountry(city);
     const timestamp = new Date().toISOString();
 
-    let total = 0;
-    const perCategory = [];
+    let totalInserted = 0;
+    const byCategory = [];
 
     for (const cat of cats) {
-      // 1) Traer TODAS las páginas de resultados para (cat + city)
       const query = `${cat} ${city}`;
       const allBase = await textSearchAllPages(query);
 
-      // 2) Traer detalles con concurrencia limitada
       const detailed = await mapWithConcurrency(
         allBase,
         DETAILS_CONCURRENCY,
@@ -263,43 +304,66 @@ app.post("/search-and-append", async (req, res) => {
           const phone = details?.formatted_phone_number ?? "N/A";
           const website = details?.website ?? "N/A";
           const place_id = details?.place_id ?? item?.place_id ?? "N/A";
-
           return { name, address, lat, lng, phone, website, place_id };
         }
       );
 
-      // 3) Mapear a filas
-      const rows = detailed.map((p) => ({
-        timestamp,
-        country,
-        city: cityOnly,
-        category: cat,
-        name: p?.name || "N/A",
-        phone: p?.phone || "N/A",
-        website: p?.website || "N/A",
-        lat: p?.lat ?? "",
-        lng: p?.lng ?? "",
-        address: p?.address || "N/A",
-        place_id: p?.place_id || "N/A",
-        source: "Glow Places",
-      }));
+      // Deduplicación:
+      // 1) descartar lo que ya existe en la hoja por place_id
+      // 2) evitar repetidos dentro del mismo batch (place_id o name+address)
+      const seenBatch = new Set();
+      const rowsToInsert = [];
+      let skippedExisting = 0;
+      let skippedBatchDup = 0;
 
-      // 4) Guardar en Sheets por bloques
-      if (rows.length > 0) {
-        await appendRowsToSheet(sheets, SHEET_ID, tabTitle, rows);
+      for (const p of detailed) {
+        if (!p) continue;
+        const pid = (p.place_id || "").trim();
+
+        // Dedup por place_id ya en hoja
+        if (pid && existingPlaceIds.has(pid)) {
+          skippedExisting++;
+          continue;
+        }
+
+        // Clave fallback si no hay place_id
+        const fallKey =
+          pid ||
+          `fallback:${normalizeKey(p.name)}|${normalizeKey(p.address)}`;
+
+        if (seenBatch.has(fallKey)) {
+          skippedBatchDup++;
+          continue;
+        }
+        seenBatch.add(fallKey);
+
+        rowsToInsert.push(buildRow(timestamp, country, cityOnly, cat, p));
+
+        // Si trae place_id real, agrégalo al set global para siguientes categorías
+        if (pid) existingPlaceIds.add(pid);
       }
 
-      perCategory.push({ category: cat, found: rows.length });
-      total += rows.length;
+      if (rowsToInsert.length > 0) {
+        await appendRowsToSheet(sheets, SHEET_ID, tabTitle, rowsToInsert);
+      }
+
+      totalInserted += rowsToInsert.length;
+      byCategory.push({
+        category: cat,
+        found: detailed.length,
+        inserted: rowsToInsert.length,
+        skipped_existing_place_id: skippedExisting,
+        skipped_batch_dups: skippedBatchDup,
+      });
     }
 
     return res.json({
       status: "ok",
       city: tabTitle,
-      total_inserted: total,
-      by_category: perCategory,
+      total_inserted: totalInserted,
+      by_category: byCategory,
       note:
-        "Paginación completa de Text Search. Pestaña = ciudad. Headers en A1. Append en bloques.",
+        "Paginación completa + deduplicación por place_id (y fallback name+address en el mismo batch).",
     });
   } catch (e) {
     console.error("search-and-append error:", e);
@@ -308,18 +372,18 @@ app.post("/search-and-append", async (req, res) => {
 });
 
 /* =========================
-   OpenAPI mínimo (opcional)
+   OpenAPI mínimo
 ========================= */
 app.get("/openapi.json", (req, res) => {
   res.json({
     openapi: "3.0.0",
-    info: { title: "Glow Market Hunter API", version: "1.1.0" },
+    info: { title: "Glow Market Hunter API", version: "1.2.0" },
     servers: [{ url: process.env.PUBLIC_URL || "http://localhost:" + PORT }],
     paths: {
       "/search-and-append": {
         post: {
           summary:
-            "Busca TODAS las páginas por ciudad+categoría(s) (Text Search) y guarda en Sheets (pestaña=ciudad).",
+            "Busca TODAS las páginas por ciudad+categoría(s), deduplica por place_id y guarda en Sheets (pestaña=ciudad).",
           requestBody: {
             required: true,
             content: {
