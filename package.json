@@ -4,7 +4,9 @@
   "description": "API para buscar negocios por ciudad y guardar resultados en Google Sheets",
   "main": "index.js",
   "type": "module",
-  "scripts": { "start": "node index.js" },
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "express": "^4.19.2",
     "body-parser": "^1.20.3",
